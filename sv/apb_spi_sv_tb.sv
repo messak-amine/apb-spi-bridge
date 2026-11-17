@@ -221,47 +221,65 @@ class apb_spi_driver;
 endclass
 
 // ----------------------------------------------------------------------------
-// 5. Passive Pin-Level SPI Monitor (Samples MOSI directly from physical wires)
+// 5. Passive Pin-Level SPI Monitor (Samples MOSI across all 4 SPI Modes)
 // ----------------------------------------------------------------------------
 class spi_monitor;
+    virtual apb_if apb_vif;
     virtual spi_if spi_vif;
     mailbox #(bit [7:0]) mon2scb;
+    bit cfg_cpha;
 
-    function new(virtual spi_if s_vif, mailbox #(bit [7:0]) m2s);
-        this.spi_vif = s_vif;
-        this.mon2scb = m2s;
+    function new(virtual apb_if a_vif, virtual spi_if s_vif, mailbox #(bit [7:0]) m2s);
+        this.apb_vif  = a_vif;
+        this.spi_vif  = s_vif;
+        this.mon2scb  = m2s;
+        this.cfg_cpha = 1'b0;
     endfunction
 
     task run();
         bit       idle_clk;
+        bit       sample_on_posedge;
         bit [7:0] sampled_byte;
 
-        forever begin
-            @(negedge spi_vif.cs_n);
-            idle_clk     = spi_vif.sclk;
-            sampled_byte = 8'd0;
+        fork
+            // Passively track CPHA configuration written to CTRL (0x00)
+            forever begin
+                @(posedge apb_vif.pclk);
+                if (apb_vif.presetn && apb_vif.psel && apb_vif.penable &&
+                    apb_vif.pwrite && apb_vif.pready && (apb_vif.paddr == 8'h00)) begin
+                    cfg_cpha = apb_vif.pwdata[2];
+                end
+            end
 
-            fork
-                begin
-                    for (int i = 0; i < 8; i++) begin
-                        if (idle_clk == 1'b0) @(posedge spi_vif.sclk);
-                        else                  @(negedge spi_vif.sclk);
-                        sampled_byte = {sampled_byte[6:0], spi_vif.mosi};
+            // Sample MOSI on leading edge (CPHA=0) or trailing edge (CPHA=1)
+            forever begin
+                @(negedge spi_vif.cs_n);
+                idle_clk          = spi_vif.sclk;
+                sample_on_posedge = (idle_clk == cfg_cpha);
+                sampled_byte      = 8'd0;
+
+                fork
+                    begin
+                        for (int i = 0; i < 8; i++) begin
+                            if (sample_on_posedge) @(posedge spi_vif.sclk);
+                            else                   @(negedge spi_vif.sclk);
+                            sampled_byte = {sampled_byte[6:0], spi_vif.mosi};
+                        end
                     end
-                end
-                begin
-                    @(posedge spi_vif.cs_n);
-                end
-            join_any
-            disable fork;
+                    begin
+                        @(posedge spi_vif.cs_n);
+                    end
+                join_any
+                disable fork;
 
-            mon2scb.put(sampled_byte);
-        end
+                mon2scb.put(sampled_byte);
+            end
+        join
     endtask
 endclass
 
 // ----------------------------------------------------------------------------
-// 6. Self-Checking Scoreboard
+// 6. Self-Checking Scoreboard (Verifies MISO & MOSI across Modes 0 to 3)
 // ----------------------------------------------------------------------------
 class spi_scoreboard;
     mailbox #(spi_transaction) drv2scb;
@@ -296,7 +314,7 @@ class spi_scoreboard;
                 $error("[SCB FAIL] MISO mismatch! Expected 0x%02h, Got 0x%02h",
                        tr.slave_tx, tr.observed_apb_rx);
                 fail_cnt++;
-            end else if ((tr.cpha == 1'b0) && (tr.observed_mosi !== tr.master_tx)) begin
+            end else if (tr.observed_mosi !== tr.master_tx) begin
                 $error("[SCB FAIL] MOSI mismatch! Expected 0x%02h, Got 0x%02h",
                        tr.master_tx, tr.observed_mosi);
                 fail_cnt++;
@@ -375,7 +393,7 @@ module apb_spi_sv_tb;
 
         gen = new(gen2drv, NUM_RANDOM_TX);
         drv = new(u_apb_if, u_spi_if, gen2drv, drv2scb);
-        mon = new(u_spi_if, mon2scb);
+        mon = new(u_apb_if, u_spi_if, mon2scb);
         scb = new(drv2scb, mon2scb);
 
         fork
