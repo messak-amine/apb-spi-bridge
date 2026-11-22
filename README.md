@@ -74,7 +74,7 @@ This **GTKWave** capture from an earlier testbench run shows an APB configuratio
 ![APB-to-SPI Simulation Waveform](docs/waveform.png)
 
 * **AMBA APB Bus (`paddr`, `pclk`, `penable`, `prdata`, `pready`, `presetn`, `psel`, `pwdata`, `pwrite`):** Shows the two-cycle APB `SETUP -> ACCESS` writes to `CTRL` (`0x00`) and `TX_DATA` (`0x08` with `pwdata = 0x000000A5`), followed by `STATUS` (`0x04`) polling returning `prdata = 0x00000001` (`busy = 1`) while the transfer is active.
-* **Internal Flags (`spi_busy`, `rx_valid`):** `spi_busy` asserts (`1`) immediately after `TX_DATA` is written, stays high throughout the 8-bit transfer, and deasserts (`0`) at the end of `STATE_DONE` as `rx_valid` asserts (`1`) to signal received data availability.
+* In this capture, `spi_busy` rises when `CS_N` goes low and falls when `CS_N` goes high. The internal `rx_valid` register rises one `PCLK` cycle later. In the current RTL, `STATUS.rx_valid` and the new `RX_DATA` byte are visible to APB as soon as `STATUS.busy` clears.
 * **External SPI Bus (`cs_n`, `sclk`, `mosi`, `miso`):** Active-low `cs_n` frames 8 `SCLK` cycles shifting `0xA5` (`1010_0101`) MSB-first onto `MOSI` while sampling `0x5A` (`0101_1010`) from `MISO`.
 
 ### 3. SystemVerilog Verification Environment (`sv/`)
