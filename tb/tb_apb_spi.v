@@ -55,10 +55,17 @@ module tb_apb_spi;
     reg [7:0] slave_rx_shift;
     reg       cpol_cfg;
     reg       cpha_cfg;
+    time      half_period;
+    time      last_spi_edge;
+    integer   spi_edge_count;
 
     wire sclk_leading = (cpol_cfg == 1'b0) ? sclk : ~sclk;
 
     always @(negedge cs_n) begin
+        if (sclk !== cpol_cfg)
+            $fatal(1, "SCLK was not idle when CS_N asserted");
+        last_spi_edge  = $time;
+        spi_edge_count = 0;
         slave_tx_shift = slave_tx_byte;
         slave_rx_shift = 8'd0;
         if (cpha_cfg == 1'b0)
@@ -87,6 +94,25 @@ module tb_apb_spi;
         end
     end
 
+    always @(sclk) begin
+        if (!cs_n) begin
+            if ($time - last_spi_edge != half_period)
+                $fatal(1, "Expected SCLK half-period of %0d ns, got %0d ns",
+                       half_period, $time - last_spi_edge);
+            last_spi_edge  = $time;
+            spi_edge_count = spi_edge_count + 1;
+        end
+    end
+
+    always @(posedge cs_n) begin
+        if (presetn) begin
+            if (spi_edge_count != 16 || sclk !== cpol_cfg)
+                $fatal(1, "Expected 16 SCLK edges and idle polarity at CS_N release");
+            if ($time - last_spi_edge != half_period)
+                $fatal(1, "Incorrect CS_N hold time after the last SCLK edge");
+        end
+    end
+
     // ------------------------------------------------------------------------
     // AMBA APB Master Bus Functional Model (Write & Read Tasks)
     // ------------------------------------------------------------------------
@@ -101,9 +127,10 @@ module tb_apb_spi;
 
             @(posedge pclk);
             penable <= 1'b1;
-            wait (pready == 1'b1);
 
             @(posedge pclk);
+            if ({pready, pslverr} !== 2'b10)
+                $fatal(1, "APB write to 0x%02h did not complete without errors or wait states", addr);
             psel    <= 1'b0;
             penable <= 1'b0;
             pwrite  <= 1'b0;
@@ -120,70 +147,95 @@ module tb_apb_spi;
 
             @(posedge pclk);
             penable <= 1'b1;
-            #1;
-            data = prdata;
 
             @(posedge pclk);
+            if ({pready, pslverr} !== 2'b10)
+                $fatal(1, "APB read from 0x%02h did not complete without errors or wait states", addr);
+            data = prdata;
             psel    <= 1'b0;
             penable <= 1'b0;
+        end
+    endtask
+
+    task expect_read(input [7:0] addr, input [31:0] expected);
+        reg [31:0] actual;
+        begin
+            apb_read(addr, actual);
+            if (actual !== expected)
+                $fatal(1, "APB read from 0x%02h: expected 0x%08h, got 0x%08h", addr, expected, actual);
         end
     endtask
 
     // ------------------------------------------------------------------------
     // Self-Checking SPI Transfer Test Task
     // ------------------------------------------------------------------------
-    integer errors;
-    reg [31:0] status_reg;
-    reg [31:0] rx_reg;
-
-    task run_spi_test(
+    task automatic run_spi_test(
         input       cpol,
         input       cpha,
         input [7:0] div,
         input [7:0] master_tx,
-        input [7:0] slave_tx
+        input [7:0] slave_tx,
+        input       reconfigure,
+        input       read_rx_at_completion
     );
         reg [31:0] ctrl_word;
         begin
             cpol_cfg      = cpol;
             cpha_cfg      = cpha;
             slave_tx_byte = slave_tx;
+            half_period   = (32'd1 + div) * 10;
 
             // Configure CTRL register: [0]=spi_en, [1]=cpol, [2]=cpha, [15:8]=clk_div
             ctrl_word = {16'd0, div, 5'd0, cpha, cpol, 1'b1};
             apb_write(8'h00, ctrl_word);
+            expect_read(8'h00, ctrl_word);
 
-            // Write payload to TX_DATA register (triggers SPI transfer)
-            apb_write(8'h08, {24'd0, master_tx});
+            fork
+                begin
+                    apb_write(8'h08, {24'd0, master_tx});
+                    expect_read(8'h04, 32'h1);
+                    if (reconfigure) begin
+                        // Change all SPI settings during the active mode 0 frame.
+                        apb_write(8'h00, 32'h0000_0107);
+                        expect_read(8'h00, 32'h0000_0107);
+                        apb_write(8'h08, {24'd0, ~master_tx});
+                        expect_read(8'h08, {24'd0, master_tx});
+                    end
+                end
+                begin
+                    @(negedge cs_n);
+                    // The frame lasts 17 half-periods. Complete the APB read
+                    // on the first PCLK edge after CS_N rises.
+                    repeat (17 * (32'd1 + div) - 2) @(posedge pclk);
+                    if (read_rx_at_completion)
+                        expect_read(8'h0C, {24'd0, slave_tx});
+                    else
+                        expect_read(8'h04, 32'h2);
+                end
+            join
 
-            // Poll STATUS register until busy (bit 0) clears
-            status_reg = 32'h1;
-            while (status_reg[0] == 1'b1) begin
-                apb_read(8'h04, status_reg);
+            if (!read_rx_at_completion) begin
+                expect_read(8'h8C, 32'd0);
+                expect_read(8'h04, 32'h2);
+                expect_read(8'h0C, {24'd0, slave_tx});
             end
+            expect_read(8'h04, 32'd0);
 
-            // Read received byte from RX_DATA register
-            apb_read(8'h0C, rx_reg);
-
-            // Verify MOSI (Master -> Slave) and MISO (Slave -> Master)
-            if (slave_rx_shift !== master_tx) begin
-                $display("[FAIL] Mode (%0d,%0d) MOSI mismatch: Expected 0x%02h, Got 0x%02h",
-                         cpol, cpha, master_tx, slave_rx_shift);
-                errors = errors + 1;
-            end else if (rx_reg[7:0] !== slave_tx) begin
-                $display("[FAIL] Mode (%0d,%0d) MISO mismatch: Expected 0x%02h, Got 0x%02h",
-                         cpol, cpha, slave_tx, rx_reg[7:0]);
-                errors = errors + 1;
-            end else begin
-                $display("[PASS] Mode (%0d,%0d) | TX=0x%02h -> Slave RX=0x%02h | Slave TX=0x%02h -> APB RX=0x%02h",
-                         cpol, cpha, master_tx, slave_rx_shift, slave_tx, rx_reg[7:0]);
-            end
+            if (reconfigure && sclk !== 1'b1)
+                $fatal(1, "SCLK did not switch to the new idle polarity after the frame");
+            if (slave_rx_shift !== master_tx)
+                $fatal(1, "SPI mode (%0d,%0d): expected MOSI byte 0x%02h, got 0x%02h",
+                       cpol, cpha, master_tx, slave_rx_shift);
+            $display("[PASS] SPI mode (%0d,%0d), divider %0d, MOSI 0x%02h, MISO 0x%02h",
+                     cpol, cpha, div, master_tx, slave_tx);
         end
     endtask
 
     // ------------------------------------------------------------------------
     // Main Stimulus Sequence
     // ------------------------------------------------------------------------
+    initial #100000 $fatal(1, "Testbench timed out");
+
     initial begin
         $dumpfile("apb_spi.vcd");
         $dumpvars(0, tb_apb_spi);
@@ -199,29 +251,36 @@ module tb_apb_spi;
         cpol_cfg      = 1'b0;
         cpha_cfg      = 1'b0;
         slave_tx_byte = 8'd0;
-        errors        = 0;
 
         // Release reset
         #25 presetn = 1'b1;
         #20;
 
-        $display("======================================================================");
-        $display(" Starting AMBA APB-to-SPI Bridge Functional Tests (Modes 0 to 3)");
-        $display("======================================================================");
+        expect_read(8'h00, 32'h0000_0400);
+        expect_read(8'h04, 32'd0);
+        expect_read(8'h0C, 32'd0);
+        apb_write(8'h08, 32'hFF); // Disabled TX write
+        apb_write(8'h10, 32'h01); // Upper address bits must prevent a CTRL write
+        expect_read(8'h08, 32'd0);
+        expect_read(8'h00, 32'h0000_0400);
+        expect_read(8'h10, 32'd0);
+        apb_write(8'h00, 32'h0000_0401);
+        apb_write(8'h18, 32'hFF);
+        apb_write(8'h09, 32'hFF);
+        expect_read(8'h08, 32'd0);
+        expect_read(8'h04, 32'd0);
+        $display("[PASS] APB reset, disabled TX, and unmapped addresses");
 
-        run_spi_test(1'b0, 1'b0, 8'd2, 8'hA5, 8'h5A); // SPI Mode 0
-        run_spi_test(1'b0, 1'b1, 8'd3, 8'h3C, 8'hC3); // SPI Mode 1
-        run_spi_test(1'b1, 1'b0, 8'd2, 8'hF0, 8'h0F); // SPI Mode 2
-        run_spi_test(1'b1, 1'b1, 8'd4, 8'h96, 8'h69); // SPI Mode 3
+        run_spi_test(1'b0, 1'b0, 8'd2,   8'hA5, 8'h5A, 1'b0, 1'b0);
+        run_spi_test(1'b0, 1'b1, 8'd3,   8'h3C, 8'hC3, 1'b0, 1'b0);
+        run_spi_test(1'b1, 1'b0, 8'd2,   8'hF0, 8'h0F, 1'b0, 1'b0);
+        run_spi_test(1'b1, 1'b1, 8'd4,   8'h96, 8'h69, 1'b0, 1'b0);
+        run_spi_test(1'b0, 1'b0, 8'd2,   8'h81, 8'h7E, 1'b1, 1'b0); // Rewrite CTRL while busy
+        run_spi_test(1'b1, 1'b1, 8'd0,   8'h57, 8'hE8, 1'b0, 1'b1); // Read RX at completion
+        run_spi_test(1'b0, 1'b1, 8'd255, 8'h01, 8'h80, 1'b0, 1'b0);
 
-        $display("======================================================================");
-        if (errors == 0)
-            $display(" RESULT: ALL TESTS PASSED (0 errors)");
-        else
-            $display(" RESULT: FAILED (%0d errors)", errors);
-        $display("======================================================================");
-
-        #50 $finish;
+        $display("RESULT: ALL TESTS PASSED");
+        $finish;
     end
 
 endmodule

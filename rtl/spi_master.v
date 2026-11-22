@@ -1,6 +1,6 @@
 // ============================================================================
 // Module: spi_master
-// Description: Synthesizable 8-bit SPI Master supporting all 4 CPOL/CPHA modes 
+// Description: Synthesizable 8-bit SPI Master supporting all 4 CPOL/CPHA modes
 //              and programmable clock division.
 // ============================================================================
 module spi_master (
@@ -33,6 +33,9 @@ module spi_master (
     reg [7:0] shift_rx;
     reg [2:0] bit_cnt;
     reg [7:0] clk_cnt;
+    reg [7:0] active_clk_div;
+    reg       active_cpol;
+    reg       active_cpha;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -47,6 +50,10 @@ module spi_master (
             sclk     <= 1'b0;
             mosi     <= 1'b0;
             cs_n     <= 1'b1;
+
+            active_clk_div <= 8'd0;
+            active_cpol    <= 1'b0;
+            active_cpha    <= 1'b0;
         end else begin
             // Default single-cycle pulse behavior
             done <= 1'b0;
@@ -59,6 +66,11 @@ module spi_master (
                     busy <= 1'b0;
 
                     if (start) begin
+                        // Keep this frame's timing stable if CTRL is rewritten.
+                        active_clk_div <= clk_div;
+                        active_cpol    <= cpol;
+                        active_cpha    <= cpha;
+
                         shift_tx <= tx_data;
                         shift_rx <= 8'd0;
                         bit_cnt  <= 3'd7;
@@ -74,13 +86,13 @@ module spi_master (
 
                 // First half of the SPI bit period (generates the leading SCLK edge)
                 STATE_LEADING: begin
-                    if (clk_cnt < clk_div) begin
+                    if (clk_cnt < active_clk_div) begin
                         clk_cnt <= clk_cnt + 8'd1;
                     end else begin
                         clk_cnt <= 8'd0;
-                        sclk    <= ~cpol;
+                        sclk    <= ~active_cpol;
 
-                        if (!cpha) begin
+                        if (!active_cpha) begin
                             // CPHA=0: Sample MISO on the leading edge
                             shift_rx <= {shift_rx[6:0], miso};
                         end else begin
@@ -93,13 +105,13 @@ module spi_master (
 
                 // Second half of the SPI bit period (generates the trailing SCLK edge)
                 STATE_TRAILING: begin
-                    if (clk_cnt < clk_div) begin
+                    if (clk_cnt < active_clk_div) begin
                         clk_cnt <= clk_cnt + 8'd1;
                     end else begin
                         clk_cnt <= 8'd0;
-                        sclk    <= cpol;
+                        sclk    <= active_cpol;
 
-                        if (!cpha) begin
+                        if (!active_cpha) begin
                             // CPHA=0: Shift next bit onto MOSI on the trailing edge
                             mosi     <= shift_tx[6];
                             shift_tx <= {shift_tx[6:0], 1'b0};
@@ -120,7 +132,7 @@ module spi_master (
 
                 // Hold CS_N low for one final half-period before completing transfer
                 STATE_DONE: begin
-                    if (clk_cnt < clk_div) begin
+                    if (clk_cnt < active_clk_div) begin
                         clk_cnt <= clk_cnt + 8'd1;
                     end else begin
                         cs_n    <= 1'b1;

@@ -34,10 +34,10 @@ module apb_slave (
 );
 
     // Register address offsets
-    localparam [3:0] ADDR_CTRL    = 4'h0,
-                     ADDR_STATUS  = 4'h4,
-                     ADDR_TX_DATA = 4'h8,
-                     ADDR_RX_DATA = 4'hC;
+    localparam [7:0] ADDR_CTRL    = 8'h00,
+                     ADDR_STATUS  = 8'h04,
+                     ADDR_TX_DATA = 8'h08,
+                     ADDR_RX_DATA = 8'h0C;
 
     reg       spi_en;
     reg       rx_valid;
@@ -50,6 +50,12 @@ module apb_slave (
     // APB ACCESS phase handshake detection
     wire apb_write = psel && penable && pwrite;
     wire apb_read  = psel && penable && !pwrite;
+    wire transfer_busy = spi_start || spi_busy;
+
+    // The SPI core presents the completed byte with done, one clock before
+    // the APB registers capture it. Reads in that cycle see the new byte too.
+    wire rx_available = rx_valid || spi_done;
+    wire [7:0] rx_read_data = spi_done ? spi_rx_data : rx_data_reg;
 
     // Sequential register write & flag management
     always @(posedge pclk or negedge presetn) begin
@@ -74,7 +80,7 @@ module apb_slave (
 
             // Handle APB register writes
             if (apb_write) begin
-                case (paddr[3:0])
+                case (paddr)
                     ADDR_CTRL: begin
                         spi_en      <= pwdata[0];
                         spi_cpol    <= pwdata[1];
@@ -83,7 +89,7 @@ module apb_slave (
                     end
 
                     ADDR_TX_DATA: begin
-                        if (spi_en && !spi_busy) begin
+                        if (spi_en && !transfer_busy) begin
                             spi_tx_data <= pwdata[7:0];
                             spi_start   <= 1'b1;
                             rx_valid    <= 1'b0;
@@ -95,7 +101,7 @@ module apb_slave (
             end
 
             // Clear rx_valid flag once CPU reads RX_DATA
-            if (apb_read && (paddr[3:0] == ADDR_RX_DATA)) begin
+            if (apb_read && (paddr == ADDR_RX_DATA)) begin
                 rx_valid <= 1'b0;
             end
         end
@@ -103,11 +109,11 @@ module apb_slave (
 
     // Combinational APB read mux
     always @(*) begin
-        case (paddr[3:0])
+        case (paddr)
             ADDR_CTRL:    prdata = {16'd0, spi_clk_div, 5'd0, spi_cpha, spi_cpol, spi_en};
-            ADDR_STATUS:  prdata = {30'd0, rx_valid, spi_busy};
+            ADDR_STATUS:  prdata = {30'd0, rx_available, transfer_busy};
             ADDR_TX_DATA: prdata = {24'd0, spi_tx_data};
-            ADDR_RX_DATA: prdata = {24'd0, rx_data_reg};
+            ADDR_RX_DATA: prdata = {24'd0, rx_read_data};
             default:      prdata = 32'd0;
         endcase
     end
