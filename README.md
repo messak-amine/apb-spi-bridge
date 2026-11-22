@@ -44,11 +44,9 @@ The top-level module (`rtl/apb_spi_top.v`) connects two blocks:
 * **Bit Order:** MSB-first (`bit 7` is transmitted/sampled first down to `bit 0`).
 * **Clock Divider Formula:** Internal counter `clk_cnt` counts from `0` to `clk_div` (`clk_div + 1` cycles of `pclk`) during both `STATE_LEADING` and `STATE_TRAILING`, giving:
 
-  ```math
-  f_{\text{SCLK}} = \frac{f_{\text{PCLK}}}{2 \times (\text{clk\_div} + 1)}
-  ```
+  `SCLK frequency = PCLK frequency / (2 × (clk_div + 1))`
 
-  At reset (`clk_div = 4`), $f_{\text{SCLK}} = f_{\text{PCLK}} / 10$.
+  At reset (`clk_div = 4`), `SCLK frequency = PCLK frequency / 10`.
 * **Chip Select (`CS_N`) Timing:** Active-low. Asserts (`0`) as soon as `start` is accepted from `STATE_IDLE`, stays low across all 8 bit periods, and holds low for one extra half-period (`clk_div + 1` cycles) in `STATE_DONE` before returning high (`1`).
 * **Configuration Updates:** The SPI core captures `cpol`, `cpha`, and `clk_div` at the start of each frame. A `CTRL` write during a frame updates the configuration for the next frame. While `CS_N` is high and the core is idle, `SCLK` follows the programmed `cpol`.
 
